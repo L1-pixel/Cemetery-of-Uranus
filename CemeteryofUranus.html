@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<title>Cemetery of Uranus - Halloween</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  html,body{margin:0;height:100%;background:#0b0f15;color:#eee;font-family:system-ui,Segoe UI,Roboto}
+  #wrap{display:grid;place-items:center;height:100%}
+  canvas{border:2px solid #27314d;background:#0b0f15}
+  .hud{position:fixed;top:10px;left:50%;transform:translateX(-50%);display:flex;gap:18px;font-weight:700}
+  .hint{position:fixed;bottom:10px;left:50%;transform:translateX(-50%);opacity:.8}
+  button{position:fixed;top:10px;right:10px;padding:6px 10px;border:1px solid #3a4a7d;background:#19223a;color:#fff;border-radius:8px;cursor:pointer}
+  .overlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.45);text-align:center}
+  .overlay.active{display:flex}
+  .card{background:#121a2f;border:1px solid #2c3a5f;border-radius:12px;padding:20px 26px;box-shadow:0 10px 30px #0008}
+  .card h1{margin:0 0 8px 0;font-size:22px}
+  .card p{margin:6px 0 0 0;opacity:.9}
+</style>
+
+<div id="wrap"><canvas id="cv" width="1000" height="460"></canvas></div>
+
+<div class="hud">
+  <div>Score: <span id="score">0</span></div>
+  <div>Speed: <span id="spd">0</span></div>
+  <div>Best: <span id="best">0</span></div>
+</div>
+<div class="hint">Space/Up — jump (double), Shift — slide, P — pause, R — restart</div>
+<button id="restart">Restart</button>
+
+<div class="overlay" id="pauseLayer"><div class="card"><h1>Paused</h1><p>Press P to resume</p></div></div>
+<div class="overlay" id="gameOverLayer">
+  <div class="card">
+    <h1>Game Over</h1>
+    <p>Distance: <b id="finalDist">0</b> m</p>
+    <p>Score: <b id="finalScore">0</b></p>
+    <p style="margin-top:10px;"><button id="againBtn">Play again</button></p>
+  </div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  // ===== Canvas / HUD =====
+  const cv = document.getElementById("cv");
+  const ctx = cv.getContext("2d");
+  const W = cv.width, H = cv.height;
+
+  const scoreEl = document.getElementById("score");
+  const spdEl   = document.getElementById("spd");
+  const bestEl  = document.getElementById("best");
+  const pauseLayer = document.getElementById("pauseLayer");
+  const overLayer  = document.getElementById("gameOverLayer");
+  const finalDist  = document.getElementById("finalDist");
+  const finalScore = document.getElementById("finalScore");
+  const restartBtn = document.getElementById("restart");
+  const againBtn   = document.getElementById("againBtn");
+
+  // ===== Assets =====
+  const SKY_IMG_SRC     = "sky_object.png";         // правый верх (теперь строго круглый)
+  const CARRIED_IMG_SRC = "uranus_transparent.png"; // уран у героя
+  const COFFIN_IMG_SRC  = "coffin.png";             // крышка гроба
+
+  const skyImg = new Image();   let skyReady=false;      skyImg.onload=()=>skyReady=true;      skyImg.src=SKY_IMG_SRC;
+  const carriedImg = new Image();let carriedReady=false; carriedImg.onload=()=>carriedReady=true;carriedImg.src=CARRIED_IMG_SRC;
+
+  const coffinImg = new Image(); let coffinReady=false;
+  const coffinNatural={w:0,h:0};
+  coffinImg.onload=()=>{coffinReady=true; coffinNatural.w=coffinImg.naturalWidth||coffinImg.width; coffinNatural.h=coffinImg.naturalHeight||coffinImg.height;};
+  coffinImg.src=COFFIN_IMG_SRC;
+
+  // ===== Input =====
+  const keys = {};
+  addEventListener("keydown", e=>{
+    keys[e.code]=true;
+    if(e.code==="KeyR" && !running) start();
+    if(e.code==="KeyP" && running){ paused=!paused; pauseLayer.classList.toggle("active",paused); }
+  });
+  addEventListener("keyup", e=> keys[e.code]=false);
+  restartBtn.onclick=()=>start();
+  againBtn.onclick = ()=>{ overLayer.classList.remove("active"); start(); };
+
+  // ===== Utils =====
+  const rnd=(a,b)=>a+Math.random()*(b-a);
+  const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+  const lerp=(a,b,t)=>a+(b-a)*t;
+
+  // ===== Game state =====
+  let running=false, paused=false, rafId=0, last=0, t=0;
+  let score=0, distance=0, best=+localStorage.halloweenBest||0;
+  bestEl.textContent = best;
+
+  const world={
+ground:H-78,
+    baseSpeed:5, speed:5,
+    parallax:[{x:0,v:0.15},{x:0,v:0.4},{x:0,v:0.9}],
+    obstacles:[],
+    spawnTimer:1100,
+    pitTimer:2600,
+    minGap:280
+  };
+
+  // Яма/гроб
+  const PIT_DEPTH_BASE=58;
+  const PIT_MARGIN_X=10;   // чуть меньше отступы по бокам, чтобы «во весь периметр»
+  const COFFIN_FILL=0.96;  // заполняем почти полностью
+
+  // Камни — немного больше
+  const STONE_W = [34,52];
+  const STONE_H = [46,70];
+
+  const skel={x:160,y:0,vy:0,w:26,h:54,onGround:true,
+    pelvisYOff:30, headR:10, thigh:14, shin:16, upper:10, fore:12,
+    phase:0, gaitRate:0, jumps:0, maxJumps:2, jumpLock:false, slide:false, slideT:0};
+
+  const BONE="#d6d9de", BONE_DARK="#b7bcc4", BONE_LIGHT="#eceff3", ACCENT="#9aa4b2";
+
+  // ===== Cemetery crosses (background) =====
+  const crosses = Array.from({length:28}, ()=>({
+    x: Math.random()*W*2 - W*0.5,
+    y: world.ground - (80 + Math.random()*90),   // выше забора
+    s: 0.6 + Math.random()*0.8,                  // масштаб
+    v: 0.25 + Math.random()*0.35                 // параллакс-скорость
+  }));
+
+  // ===== Start/Reset/Over =====
+  function reset(){
+    if(rafId) cancelAnimationFrame(rafId);
+    world.speed=world.baseSpeed;
+    world.obstacles.length=0;
+    world.spawnTimer=1100; world.pitTimer=2700;
+    score=0; distance=0; t=0;
+    Object.assign(skel,{y:world.ground-skel.h,vy:0,onGround:true,phase:0,gaitRate:0,jumps:0,jumpLock:false,slide:false,slideT:0});
+  }
+  function start(){
+    reset(); running=true; paused=false; last=performance.now();
+    pauseLayer.classList.remove("active"); overLayer.classList.remove("active");
+    loop(last);
+  }
+  function gameOver(){
+    running=false;
+    best=Math.max(best,Math.floor(score)); localStorage.halloweenBest=best; bestEl.textContent=best;
+    finalDist.textContent=Math.floor(distance);
+    finalScore.textContent=Math.floor(score);
+    overLayer.classList.add("active");
+  }
+
+  // ===== Speed curve =====
+  function updateSpeed(){
+    if(score<300){ world.speed=world.baseSpeed; return; }
+    const bumps=Math.floor((score-300)/1000);
+    world.speed=world.baseSpeed + bumps*0.6;
+  }
+
+  // ===== Spawning =====
+  const lastObstacle=()=>world.obstacles.length? world.obstacles[world.obstacles.length-1] : null;
+  function canPlace(x){ const lo=lastObstacle(); return !lo || (x-(lo.x+(lo.w||60))>world.minGap); }
+  function spawnStone(){
+    const w=rnd(...STONE_W), h=rnd(...STONE_H);
+    let x=W+40; if(!canPlace(x)) x=lastObstacle().x+(lastObstacle().w||100)+world.minGap;
+    world.obstacles.push({type:"stone",x, y:world.ground-h, w, h, passed:false});
+  }
+  function spawnPit(){
+    const w=rnd(140,200);
+    let x=W+40; if(!canPlace(x)) x=lastObstacle().x+(lastObstacle().w||100)+world.minGap;
+    world.obstacles.push({type:"pit",x,w,passed:false});
+  }
+
+  // ===== Update =====
+  const rectsOverlap=(x1,y1,w1,h1,x2,y2,w2,h2)=>x1<x2+w2 && x1+w1>x2 && y1<y2+h2 && y1+h1>y2;
+
+  function update(dt){
+    if(!running||paused) return;
+    t+=dt;
+
+    // input
+    const wantJump=keys["Space"]||keys["ArrowUp"];
+    if(wantJump && (skel.onGround||skel.jumps<skel.maxJumps)){
+      if(!skel.jumpLock){ skel.vy=-(skel.jumps===0?11:9.6); skel.onGround=false; skel.jumps++; skel.jumpLock=true; }
+    } else skel.jumpLock=false;
+    skel.slide=!!keys["ShiftLeft"] && skel.onGround;
+    skel.slideT=skel.slide?1:Math.max(0,skel.slideT-dt*0.0014);
+
+    // physics
+    skel.vy+=0.55; skel.y+=skel.vy;
+
+    // pits ground
+    const feet=skel.x+skel.w*0.5; let pit=null;
+    for(const o of world.obstacles){ if(o.type==="pit" && feet>o.x && feet<o.x+o.w){ pit=o; break; } }
+    if(!pit){
+      if(skel.y+skel.h>=world.ground){ skel.y=world.ground-skel.h; skel.vy=0; skel.onGround=true; skel.jumps=0; }
+      else skel.onGround=false;
+    }else{
+      skel.onGround=false; if(skel.y>H) return gameOver();
+    }
+
+    // gait
+    const sec=dt/1000, baseRate=lerp(1.7,2.4,clamp((world.speed-5)/4,0,1));
+    const targetRate=skel.onGround&&!skel.slide?baseRate:baseRate*0.55;
+    skel.gaitRate=lerp(skel.gaitRate,targetRate,0.12);
+    skel.phase=(skel.phase+skel.
+gaitRate*sec)%1;
+
+    // spawn
+    world.spawnTimer-=dt; if(world.spawnTimer<=0){spawnStone(); world.spawnTimer=rnd(1200,1650);}
+    world.pitTimer-=dt;   if(world.pitTimer<=0){spawnPit();   world.pitTimer  =rnd(2900,3900);}
+
+    // move & score
+    const dx=world.speed; distance+=dx*0.05;
+    for(const o of world.obstacles) o.x-=dx;
+
+    // collisions
+    for(const o of world.obstacles){
+      if(o.type==="stone"){
+        const ph=skel.slide?skel.h*0.6:skel.h, py=skel.y+(skel.h-ph);
+        if(rectsOverlap(skel.x,py,skel.w,ph, o.x,o.y,o.w,o.h)) return gameOver();
+        if(!o.passed && o.x+o.w<skel.x){ o.passed=true; score+=30; }
+      }else if(o.type==="pit"){
+        if(!o.passed && o.x+o.w<skel.x){ o.passed=true; score+=40; }
+      }
+    }
+    world.obstacles=world.obstacles.filter(o=>o.x>-260);
+
+    score+=world.speed*0.08; updateSpeed();
+    scoreEl.textContent=Math.floor(score); spdEl.textContent=world.speed.toFixed(1);
+  }
+
+  // ===== Drawing =====
+  const stars=Array.from({length:160},()=>({x:Math.random()*W,y:Math.random()*H*0.75,s:Math.random()*1.2+0.3,tw:Math.random()*Math.PI*2}));
+
+  function drawSky(){
+    // bg
+    const g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,"#0c1230"); g.addColorStop(1,"#0b0f15");
+    ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+
+    // stars
+    ctx.fillStyle="#cfd7ff";
+    for(const st of stars){ const a=0.7+0.3*Math.sin(t*0.003+st.tw); ctx.globalAlpha=a; ctx.fillRect(st.x,st.y,st.s,st.s); }
+    ctx.globalAlpha=1;
+
+    // sky object (круглая маска + кольцевая обводка + лёгкое покачивание)
+    if(skyReady){
+      const imgW=210, imgH=210;
+      const px=W-imgW-24 + Math.sin(t*0.0008)*2;
+      const py=22 + Math.sin(t*0.0012)*1.2;
+
+      const cx=px+imgW/2, cy=py+imgH/2, r=Math.max(imgW,imgH)*0.48;
+
+      // ореол
+      const glow=ctx.createRadialGradient(cx,cy, r*0.2, cx,cy, r*1.25);
+      glow.addColorStop(0,"rgba(90,200,255,.35)");
+      glow.addColorStop(1,"rgba(90,200,255,0)");
+      ctx.fillStyle=glow; ctx.beginPath(); ctx.arc(cx,cy,r*1.1,0,Math.PI*2); ctx.fill();
+
+      // круглая маска
+      ctx.save();
+      ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.clip();
+      ctx.globalCompositeOperation="screen";
+      ctx.drawImage(skyImg, px, py, imgW, imgH);
+      ctx.globalCompositeOperation="source-over";
+      ctx.restore();
+
+      // деликатная обводка
+      ctx.strokeStyle="rgba(200,230,255,.55)";
+      ctx.lineWidth=1.5;
+      ctx.beginPath(); ctx.arc(cx,cy,r+0.5,0,Math.PI*2); ctx.stroke();
+    }
+  }
+
+  function drawFence(){
+    const y=world.ground-18, shift=(t*0.12)%40;
+    ctx.fillStyle="#1a223a";
+    for(let x=-shift; x<W+40; x+=40){
+      ctx.fillRect(x,y,10,28);
+      ctx.beginPath(); ctx.moveTo(x+5,y-10); ctx.lineTo(x+1,y); ctx.lineTo(x+9,y); ctx.closePath(); ctx.fill();
+    }
+    ctx.fillRect(0,y+6,W,4);
+    ctx.fillRect(0,y+16,W,4);
+  }
+
+  function drawCross(x,y,s,alpha){
+    ctx.save();
+    ctx.translate(x,y); ctx.scale(s,s);
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = "#0e1626";
+    // вертикальная
+    ctx.fillRect(-2, -16, 4, 32);
+    // горизонтальная
+    ctx.fillRect(-10, -2, 20, 4);
+    ctx.restore();
+  }
+
+  function drawGround(){
+    // дальние силуэты
+    for(const p of world.parallax){
+      p.x=(p.x-world.speed*p.v)%W;
+      ctx.fillStyle=p.v<0.2?"#0f1830":p.v<0.5?"#0e162b":"#0c1426";
+      const base=H-200+(p.v*50); ctx.fillRect(p.x,base,W,220); ctx.fillRect(p.x+W,base,W,220);
+    }
+
+    // случайные кресты на фоне (параллакс)
+    for(const c of crosses){
+      c.x -= world.speed*c.v;
+      if(c.x < -60) c.x += W*2;
+      drawCross(c.x, c.y, c.s, 0.7);
+    }
+
+    ctx.fillStyle="#16203a"; ctx.fillRect(0,world.ground,W,H-world.ground);
+    drawFence();
+  }
+
+  // реалистичная яма с гробом «во весь периметр»
+  function drawPit(o){
+    // вычислим внутренний прямоугольник
+    const innerX = o.x + PIT_MARGIN_X;
+    let depth = PIT_DEPTH_BASE;
+    const innerW = o.w - PIT_MARGIN_X*2;
+    let innerH = PIT_DEPTH_BASE - 10;
+
+    // если картинка готова — сделаем cover (заполнить полностью, с возможной обрезкой)
+if(coffinReady && coffinNatural.w>0 && coffinNatural.h>0){
+      // увеличим глубину, если картинка «просит» больше места (для «периметра»)
+      depth = Math.max(PIT_DEPTH_BASE, Math.round((coffinNatural.h / coffinNatural.w) * innerW * 0.35) + 18);
+      innerH = depth - 12;
+    }
+
+    // яма: дно + стенки
+    ctx.fillStyle="#06090f"; ctx.fillRect(o.x, world.ground, o.w, depth);
+    ctx.fillStyle="#0a0f1b";
+    ctx.fillRect(o.x+2, world.ground, 6, depth);
+    ctx.fillRect(o.x+o.w-8, world.ground, 6, depth);
+
+    // кромка
+    const rim=ctx.createLinearGradient(o.x,world.ground-6,o.x,world.ground+6);
+    rim.addColorStop(0,"transparent"); rim.addColorStop(1,"#0e1626");
+    ctx.fillStyle=rim; ctx.fillRect(o.x-6,world.ground-4,o.w+12,8);
+
+    // гроб: cover в прямоугольник (innerX .. innerX+innerW, world.ground+6 .. +innerH)
+    if(coffinReady && coffinNatural.w>0 && coffinNatural.h>0){
+      const targetX = innerX, targetY = world.ground + 6;
+      const targetW = innerW, targetH = innerH;
+
+      // масштаб под "cover"
+      const sx = targetW / coffinNatural.w;
+      const sy = targetH / coffinNatural.h;
+      const scale = Math.max(sx, sy); // cover: заполняем полностью, можем обрезать
+
+      const drawW = coffinNatural.w * scale;
+      const drawH = coffinNatural.h * scale;
+      const dx = targetX + (targetW - drawW)/2;
+      const dy = targetY + (targetH - drawH)/2;
+
+      // клипим по целевой области и рисуем
+      ctx.save();
+      ctx.beginPath(); ctx.rect(targetX, targetY, targetW, targetH); ctx.clip();
+      ctx.drawImage(coffinImg, dx, dy, drawW, drawH);
+      ctx.restore();
+    }
+
+    // боковая тень
+    const eg=ctx.createLinearGradient(o.x,0,o.x+o.w,0);
+    eg.addColorStop(0,"#0b101e"); eg.addColorStop(0.5,"transparent"); eg.addColorStop(1,"#0b101e");
+    ctx.fillStyle=eg; ctx.fillRect(o.x-6,world.ground-4,o.w+12,6);
+  }
+
+  function drawTombstone(x,y,w,h){
+    const topH=h*0.32;
+    const g=ctx.createLinearGradient(0,y,0,y+h);
+    g.addColorStop(0,"#b3bbc9"); g.addColorStop(1,"#6a7486");
+    ctx.fillStyle=g;
+    ctx.beginPath();
+    ctx.moveTo(x,y+h); ctx.lineTo(x,y+topH);
+    ctx.quadraticCurveTo(x+w/2,y-topH*0.6,x+w,y+topH);
+    ctx.lineTo(x+w,y+h); ctx.closePath(); ctx.fill();
+    ctx.globalAlpha=0.25; ctx.fillStyle="#000"; ctx.fillRect(x+w*0.65,y+topH,w*0.35,h-topH); ctx.globalAlpha=1;
+    ctx.fillStyle="rgba(0,0,0,.28)"; ctx.font=Math.max(9,Math.floor(w*0.24))+"px serif";
+    ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText("RIP",x+w/2,y+topH+18);
+    ctx.globalAlpha=0.35; ctx.fillStyle="#000"; ctx.fillRect(x,y+h,w,3); ctx.globalAlpha=1;
+  }
+
+  // ===== Skeleton (как раньше, без чёрной подложки под картинкой) =====
+  function limb(x1,y1,len,ang,color,width){
+    const x2=x1+Math.cos(ang)*len, y2=y1+Math.sin(ang)*len;
+    ctx.strokeStyle=color; ctx.lineWidth=width;
+    ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+    ctx.fillStyle=color; ctx.beginPath(); ctx.arc(x1,y1,1.6,0,Math.PI*2); ctx.fill();
+    return {x:x2,y:y2};
+  }
+  function drawSkull(cx, cy, r){
+    ctx.fillStyle=BONE_LIGHT; ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle=BONE_DARK; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.arc(cx,cy+2,r*0.85,0.15*Math.PI,0.85*Math.PI); ctx.stroke();
+    ctx.fillStyle="#222"; ctx.beginPath(); ctx.arc(cx-r*0.45,cy-2,r*0.28,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(cx+r*0.45,cy-2,r*0.28,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(cx,cy-1); ctx.lineTo(cx-2,cy+3); ctx.lineTo(cx+2,cy+3); ctx.closePath(); ctx.fill();
+  }
+  function drawSkeleton(){
+    const x=skel.x, y=skel.y, cx=x+skel.w/2;
+    const cycle=skel.phase;
+    const bob=2*(1-Math.cos(2*Math.PI*cycle))*(skel.onGround?1:0.4);
+    const pelvisX=cx, lean=skel.onGround?-0.16:-0.05;
+
+    drawSkull(cx,y+10-bob*0.25,skel.headR);
+
+    ctx.save(); ctx.translate(pelvisX,y+10-bob*0.25); ctx.rotate(lean);
+    ctx.strokeStyle=BONE; ctx.lineWidth=2.6; ctx.beginPath(); ctx.moveTo(0,8); ctx.lineTo(0,24); ctx.stroke();
+
+    const shoulderX=0, shoulderY=16, s=Math.
+sin(2*Math.PI*cycle);
+    let thighF=0.7+0.5*s, thighB=0.9-0.5*s;
+    if(!skel.onGround){ thighF=0.6; thighB=1.25; }
+    const k1=limb(-2,24, skel.thigh, thighF, BONE, 2.4); limb(k1.x,k1.y, skel.shin, thighF+0.55, BONE, 2.4);
+    const k2=limb( 2,24, skel.thigh, thighB, BONE, 2.4); limb(k2.x,k2.y, skel.shin, thighB+0.55, BONE, 2.4);
+
+    const armSwingF=-0.25+(-0.6)*s;
+    const eL=limb(shoulderX,shoulderY, skel.upper, armSwingF, BONE_DARK, 2.2);
+    limb(eL.x,eL.y, skel.fore, armSwingF-0.25, BONE_DARK, 2.2);
+
+    // PNG без подложки
+    if(carriedReady){
+      const pw=22, ph=22, px=6, py=22;
+      ctx.save(); ctx.translate(px,py); ctx.rotate(-0.12);
+      ctx.save(); ctx.globalAlpha=0.18; ctx.fillStyle="#8adfff";
+      ctx.beginPath(); ctx.ellipse(0,0,pw*0.58,ph*0.42,0,0,Math.PI*2); ctx.fill(); ctx.restore();
+      ctx.drawImage(carriedImg, -pw/2, -ph/2, pw, ph);
+      ctx.restore();
+    }
+
+    const hold=-0.75;
+    const eR=limb(shoulderX,shoulderY, skel.upper, hold, BONE_DARK, 2.2);
+    limb(eR.x,eR.y, skel.fore, hold-0.2, BONE_DARK, 2.2);
+
+    ctx.strokeStyle=ACCENT; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(-6,22); ctx.lineTo(6,22); ctx.stroke();
+    ctx.restore();
+  }
+
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+    drawSky();
+    drawGround();
+
+    for(const o of world.obstacles) if(o.type==="pit")   drawPit(o);
+    for(const o of world.obstacles) if(o.type==="stone") drawTombstone(o.x,o.y,o.w,o.h);
+
+    drawSkeleton();
+  }
+
+  function loop(now){
+    const dt=Math.min(40, now-(last||now)); last=now;
+    if(running && !paused) update(dt);
+    draw();
+    rafId=requestAnimationFrame(loop);
+  }
+
+  if(document.readyState==="loading") document.addEventListener("DOMContentLoaded", start);
+  else start();
+})();
+</script>
+</html>
